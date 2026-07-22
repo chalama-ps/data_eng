@@ -23,7 +23,9 @@ Configuration is driven entirely by environment variables (optionally via a
     DB_RETRY_BACKOFF   Seconds to wait between retries (default: 5).
     FETCH_BATCH_SIZE   Rows fetched from the cursor per round-trip (default: 1000).
     TABLES_CONFIG      Path to include/exclude YAML file (default: "tables.yaml").
-    LOG_FILE           Path to the log file (default: "export.log").
+    LOG_DIR            Directory for log files (default: "logs").
+    LOG_FILE           Log file name (default: "export.log"); a timestamp is
+                       inserted and it is written under LOG_DIR.
     LOG_LEVEL          Logging level (default: "INFO").
 
 Table rules (tables.yaml) may use fully-qualified "schema.table" names, or
@@ -101,6 +103,9 @@ def setup_logging(log_file: str = "export.log", level: str = "INFO") -> None:
     root.addHandler(console_handler)
 
     try:
+        parent = Path(log_file).parent
+        if parent != Path(""):
+            parent.mkdir(parents=True, exist_ok=True)
         file_handler = RotatingFileHandler(
             log_file, maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8"
         )
@@ -417,12 +422,12 @@ def _export_table_once(
     """Perform a single export attempt for one table. See export_table."""
     table_fqn = full_table_name(schema, table)
     logger.info(f"Exporting {table_fqn}...")
-    out_file = Path(output_dir) / f"{schema}__{table}.json"
+    out_file = Path(output_dir) / f"{table}.json"
     qualified = f"{quote_identifier(schema)}.{quote_identifier(table)}"
 
     cursor = conn.cursor()
     tmp_fd, tmp_path = tempfile.mkstemp(
-        dir=output_dir, prefix=f"{schema}__{table}.", suffix=".tmp"
+        dir=output_dir, prefix=f"{table}.", suffix=".tmp"
     )
     count = 0
     try:
@@ -523,8 +528,10 @@ def write_manifest(output_dir: str, manifest: dict) -> None:
 
 def main() -> int:
     """Execute the export and return a process exit code."""
+    log_dir = os.getenv("LOG_DIR", "logs")
+    log_file = timestamped_filename(os.getenv("LOG_FILE", "export.log"))
     setup_logging(
-        log_file=timestamped_filename(os.getenv("LOG_FILE", "export.log")),
+        log_file=str(Path(log_dir) / log_file) if log_dir else log_file,
         level=os.getenv("LOG_LEVEL", "INFO"),
     )
 
@@ -589,7 +596,7 @@ def main() -> int:
                 table_results.append(
                     {
                         "table": table_fqn,
-                        "file": f"{schema}__{table}.json",
+                        "file": f"{table}.json",
                         "rows": rows,
                         "status": "ok",
                     }
