@@ -26,7 +26,8 @@ Configuration is driven entirely by environment variables (optionally via a
     LOG_FILE           Path to the log file (default: "export.log").
     LOG_LEVEL          Logging level (default: "INFO").
 
-Table rules (tables.yaml) must use fully-qualified "schema.table" names.
+Table rules (tables.yaml) may use fully-qualified "schema.table" names, or
+bare "table" names which are qualified with DB_SCHEMA.
 
 The source is assumed to be a static, restored database (no concurrent DML),
 so no transaction isolation handling is required.
@@ -93,7 +94,7 @@ def setup_logging(log_file: str = "export.log", level: str = "INFO") -> None:
     for handler in list(root.handlers):
         root.removeHandler(handler)
 
-    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
 
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(fmt)
@@ -179,11 +180,26 @@ def load_config() -> dict:
     return config
 
 
-def load_table_rules(path: str = "tables.yaml") -> Tuple[Set[str], Set[str]]:
+def qualify_name(name: str, default_schema: Optional[str]) -> str:
+    """Qualify a bare table name with the default schema.
+
+    Names that already contain a schema part (a ".") are returned unchanged.
+    e.g. "customer" + default "dbo" -> "dbo.customer"; "sales.customer" stays.
+    """
+    stripped = name.strip()
+    if "." in stripped or not default_schema:
+        return stripped
+    return f"{default_schema}.{stripped}"
+
+
+def load_table_rules(
+    path: str = "tables.yaml", default_schema: Optional[str] = None
+) -> Tuple[Set[str], Set[str]]:
     """Load include/exclude table rules from a YAML file.
 
-    Rules must use fully-qualified "schema.table" names. Missing file or empty
-    rules are treated as 'export everything'.
+    Entries may be fully-qualified "schema.table" names, or bare table names
+    which are qualified with ``default_schema`` (from DB_SCHEMA). Missing file
+    or empty rules are treated as 'export everything'.
 
     Raises:
         ValueError: If the YAML is malformed or has an unexpected structure.
@@ -206,8 +222,12 @@ def load_table_rules(path: str = "tables.yaml") -> Tuple[Set[str], Set[str]]:
             f"'{path}' must contain a mapping with 'include'/'exclude' keys."
         )
 
-    include_tables = set(table_config.get("include") or [])
-    exclude_tables = set(table_config.get("exclude") or [])
+    include_tables = {
+        qualify_name(n, default_schema) for n in (table_config.get("include") or [])
+    }
+    exclude_tables = {
+        qualify_name(n, default_schema) for n in (table_config.get("exclude") or [])
+    }
     logger.info(
         f"Loaded table rules: {len(include_tables)} include, "
         f"{len(exclude_tables)} exclude."
@@ -515,7 +535,9 @@ def main() -> int:
         return 1
 
     try:
-        include_tables, exclude_tables = load_table_rules(config["tables_config"])
+        include_tables, exclude_tables = load_table_rules(
+            config["tables_config"], config.get("schema")
+        )
     except ValueError as exc:
         logger.error(f"Table rules error: {exc}")
         return 1
