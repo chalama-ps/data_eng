@@ -23,10 +23,23 @@ Configuration is driven entirely by environment variables (optionally via a
     DB_RETRY_BACKOFF   Seconds to wait between retries (default: 5).
     FETCH_BATCH_SIZE   Rows fetched from the cursor per round-trip (default: 1000).
     TABLES_CONFIG      Path to include/exclude YAML file (default: "tables.yaml").
+    MANIFEST_DIR       Directory for the run manifest (default: "manifests").
+                       Kept local; never uploaded to S3.
     LOG_DIR            Directory for log files (default: "logs").
     LOG_FILE           Log file name (default: "export.log"); a timestamp is
                        inserted and it is written under LOG_DIR.
     LOG_LEVEL          Logging level (default: "INFO").
+    S3_ENABLED         "yes" to also upload each table's JSON file to S3
+                       (default: "no"). Local files are always kept.
+    S3_BUCKET          Target S3 bucket (required when S3_ENABLED=yes).
+    S3_PREFIX          Optional key prefix within the bucket (default: "").
+    AWS_REGION         AWS region for the S3 client (falls back to
+                       AWS_DEFAULT_REGION / the default chain).
+    AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN
+                       Optional explicit credentials. When omitted, boto3's
+                       standard credential chain is used (env, profile, IAM
+                       role, SSO, etc.). Only table JSON files go to S3; logs
+                       and the manifest always stay local.
 
 Table rules (tables.yaml) may use fully-qualified "schema.table" names, or
 bare "table" names which are qualified with DB_SCHEMA.
@@ -169,6 +182,14 @@ def load_config() -> dict:
         "connect_retries": max(0, _get_int_env("DB_CONNECT_RETRIES", 3)),
         "retry_backoff": max(1, _get_int_env("DB_RETRY_BACKOFF", 5)),
         "fetch_batch_size": max(1, _get_int_env("FETCH_BATCH_SIZE", DEFAULT_FETCH_BATCH_SIZE)),
+        "manifest_dir": os.getenv("MANIFEST_DIR", "manifests"),
+        "s3_enabled": _get_bool_env("S3_ENABLED", False),
+        "s3_bucket": os.getenv("S3_BUCKET"),
+        "s3_prefix": os.getenv("S3_PREFIX", ""),
+        "aws_region": os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION"),
+        "aws_access_key_id": os.getenv("AWS_ACCESS_KEY_ID"),
+        "aws_secret_access_key": os.getenv("AWS_SECRET_ACCESS_KEY"),
+        "aws_session_token": os.getenv("AWS_SESSION_TOKEN"),
     }
 
     missing = [k for k in ("server", "database") if not config[k]]
@@ -181,6 +202,9 @@ def load_config() -> dict:
 
     if config["username"] and not config["password"]:
         raise ValueError("DB_USERNAME is set but DB_PASSWORD is missing.")
+
+    if config["s3_enabled"] and not config["s3_bucket"]:
+        raise ValueError("S3_ENABLED is set but S3_BUCKET is missing.")
 
     return config
 
@@ -411,6 +435,57 @@ def _iter_rows(cursor: pyodbc.Cursor, batch_size: int) -> Iterable[Any]:
             yield row
 
 
+def table_output_file(output_dir: str, table: str) -> Path:
+    """Return the local JSON output path for a table."""
+    return Path(output_dir) / f"{table}.json"
+
+
+def build_s3_key(prefix: Optional[str], filename: str) -> str:
+    """Join an optional prefix and a filename into an S3 object key."""
+    clean_prefix = (prefix or "").strip("/")
+    return f"{clean_prefix}/{filename}" if clean_prefix else filename
+
+
+def create_s3_client(config: dict) -> Any:
+    """Create a boto3 S3 client.
+
+    Explicit AWS credentials from the config are used when present; otherwise
+    boto3's standard credential chain (env vars, shared config, IAM role, SSO)
+    is used. boto3 is imported lazily so the dependency is only required when
+    S3 upload is enabled.
+
+    Raises:
+        RuntimeError: If boto3 is not installed.
+    """
+    try:
+        import boto3
+    except ImportError as exc:
+        raise RuntimeError(
+            "S3_ENABLED is set but boto3 is not installed. "
+            "Install it with 'pip install boto3'."
+        ) from exc
+
+    client_kwargs: Dict[str, Any] = {}
+    if config.get("aws_region"):
+        client_kwargs["region_name"] = config["aws_region"]
+    if config.get("aws_access_key_id") and config.get("aws_secret_access_key"):
+        client_kwargs["aws_access_key_id"] = config["aws_access_key_id"]
+        client_kwargs["aws_secret_access_key"] = config["aws_secret_access_key"]
+        if config.get("aws_session_token"):
+            client_kwargs["aws_session_token"] = config["aws_session_token"]
+
+    return boto3.client("s3", **client_kwargs)
+
+
+def upload_file_to_s3(s3_client: Any, bucket: str, key: str, file_path: Path) -> None:
+    """Upload a local file to S3.
+
+    boto3's ``upload_file`` transparently switches to a multipart, retrying
+    transfer for large files, so arbitrarily large table exports upload safely.
+    """
+    s3_client.upload_file(str(file_path), bucket, key)
+
+
 def _export_table_once(
     conn: pyodbc.Connection,
     schema: str,
@@ -422,7 +497,7 @@ def _export_table_once(
     """Perform a single export attempt for one table. See export_table."""
     table_fqn = full_table_name(schema, table)
     logger.info(f"Exporting {table_fqn}...")
-    out_file = Path(output_dir) / f"{table}.json"
+    out_file = table_output_file(output_dir, table)
     qualified = f"{quote_identifier(schema)}.{quote_identifier(table)}"
 
     cursor = conn.cursor()
@@ -470,7 +545,7 @@ def _export_table_once(
     finally:
         cursor.close()
 
-    logger.info(f"  -> {out_file} ({count} rows)")
+    logger.info(f"Export file {out_file} ({count} rows)")
     return count
 
 
@@ -511,17 +586,21 @@ def export_table(
             time.sleep(backoff)
 
 
-def write_manifest(output_dir: str, manifest: dict) -> None:
-    """Write the run manifest to a temp file and atomically rename it."""
-    manifest_path = Path(output_dir) / timestamped_filename("_manifest.json")
+def write_manifest(manifest_dir: str, manifest: dict) -> None:
+    """Write the run manifest to a temp file and atomically rename it.
+
+    The manifest is always written locally (never uploaded to S3).
+    """
+    manifest_path = Path(manifest_dir) / timestamped_filename("_manifest.json")
     try:
+        Path(manifest_dir).mkdir(parents=True, exist_ok=True)
         tmp_fd, tmp_path = tempfile.mkstemp(
-            dir=output_dir, prefix="_manifest.", suffix=".tmp"
+            dir=manifest_dir, prefix="_manifest.", suffix=".tmp"
         )
         with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
             json.dump(manifest, f, ensure_ascii=False, indent=2)
         os.replace(tmp_path, manifest_path)
-        logger.info(f"Wrote run manifest -> {manifest_path}")
+        logger.info(f"Wrote run manifest file {manifest_path}")
     except OSError as exc:
         logger.warning(f"Could not write manifest '{manifest_path}': {exc}")
 
@@ -579,8 +658,21 @@ def main() -> int:
             )
             return 1
 
+        s3_client = None
+        if config["s3_enabled"]:
+            try:
+                s3_client = create_s3_client(config)
+            except RuntimeError as exc:
+                logger.error(str(exc))
+                return 1
+            logger.info(
+                f"S3 upload enabled: bucket '{config['s3_bucket']}', "
+                f"prefix '{config['s3_prefix']}'."
+            )
+
         for schema, table in tables_to_export:
             table_fqn = full_table_name(schema, table)
+            out_file = table_output_file(config["output_dir"], table)
             try:
                 rows = export_table(
                     conn,
@@ -591,16 +683,6 @@ def main() -> int:
                     backoff=config["retry_backoff"],
                     batch_size=config["fetch_batch_size"],
                 )
-                exported += 1
-                total_rows += rows
-                table_results.append(
-                    {
-                        "table": table_fqn,
-                        "file": f"{table}.json",
-                        "rows": rows,
-                        "status": "ok",
-                    }
-                )
             except DataIntegrityError as exc:
                 failures += 1
                 logger.error(f"Integrity check failed for {table_fqn}: {exc}")
@@ -608,6 +690,7 @@ def main() -> int:
                     {"table": table_fqn, "rows": None, "status": "integrity_error",
                      "error": str(exc)}
                 )
+                continue
             except pyodbc.Error as exc:
                 failures += 1
                 logger.error(f"Database error exporting {table_fqn}: {exc}")
@@ -615,6 +698,7 @@ def main() -> int:
                     {"table": table_fqn, "rows": None, "status": "db_error",
                      "error": str(exc)}
                 )
+                continue
             except Exception as exc:
                 failures += 1
                 logger.exception(f"Failed to export {table_fqn}")
@@ -622,6 +706,39 @@ def main() -> int:
                     {"table": table_fqn, "rows": None, "status": "error",
                      "error": str(exc)}
                 )
+                continue
+
+            result: Dict[str, Any] = {
+                "table": table_fqn,
+                "file": out_file.name,
+                "rows": rows,
+                "status": "ok",
+            }
+
+            if s3_client is not None:
+                key = build_s3_key(config["s3_prefix"], out_file.name)
+                try:
+                    upload_file_to_s3(
+                        s3_client, config["s3_bucket"], key, out_file
+                    )
+                except Exception as exc:
+                    failures += 1
+                    logger.error(f"Failed to upload {table_fqn} to S3: {exc}")
+                    result.update(
+                        status="s3_error", s3_uploaded=False, error=str(exc)
+                    )
+                    table_results.append(result)
+                    continue
+                result["s3_key"] = key
+                result["s3_uploaded"] = True
+                logger.info(
+                    f"Uploaded {out_file.name} to "
+                    f"s3://{config['s3_bucket']}/{key}"
+                )
+
+            exported += 1
+            total_rows += rows
+            table_results.append(result)
     except pyodbc.Error as exc:
         logger.error(f"Database error: {exc}")
         return 1
@@ -641,7 +758,7 @@ def main() -> int:
     finished_at = datetime.datetime.now(datetime.timezone.utc)
     if table_results:
         write_manifest(
-            config["output_dir"],
+            config["manifest_dir"],
             {
                 "run_id": run_id,
                 "started_at": started_at.isoformat(),
@@ -650,6 +767,9 @@ def main() -> int:
                 "database": config["database"],
                 "schema_filter": config.get("schema"),
                 "strict_row_count": config["strict_row_count"],
+                "s3_enabled": config["s3_enabled"],
+                "s3_bucket": config["s3_bucket"] if config["s3_enabled"] else None,
+                "s3_prefix": config["s3_prefix"] if config["s3_enabled"] else None,
                 "tables_exported": exported,
                 "tables_failed": failures,
                 "total_rows": total_rows,
