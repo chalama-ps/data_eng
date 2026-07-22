@@ -33,6 +33,8 @@ Configuration is driven entirely by environment variables (optionally via a
                        (default: "no"). Local files are always kept.
     S3_BUCKET          Target S3 bucket (required when S3_ENABLED=yes).
     S3_PREFIX          Optional key prefix within the bucket (default: "").
+    DUMP_PERIOD        Optional path segment inserted after S3_PREFIX, e.g. a
+                       period/run folder: s3://bucket/<prefix>/<period>/table.json.
     AWS_REGION         AWS region for the S3 client (falls back to
                        AWS_DEFAULT_REGION / the default chain).
     AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN
@@ -186,6 +188,7 @@ def load_config() -> dict:
         "s3_enabled": _get_bool_env("S3_ENABLED", False),
         "s3_bucket": os.getenv("S3_BUCKET"),
         "s3_prefix": os.getenv("S3_PREFIX", ""),
+        "dump_period": os.getenv("DUMP_PERIOD", ""),
         "aws_region": os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION"),
         "aws_access_key_id": os.getenv("AWS_ACCESS_KEY_ID"),
         "aws_secret_access_key": os.getenv("AWS_SECRET_ACCESS_KEY"),
@@ -440,10 +443,19 @@ def table_output_file(output_dir: str, table: str) -> Path:
     return Path(output_dir) / f"{table}.json"
 
 
-def build_s3_key(prefix: Optional[str], filename: str) -> str:
-    """Join an optional prefix and a filename into an S3 object key."""
-    clean_prefix = (prefix or "").strip("/")
-    return f"{clean_prefix}/{filename}" if clean_prefix else filename
+def build_s3_key(prefix: Optional[str], period: Optional[str], filename: str) -> str:
+    """Join optional prefix and period segments with a filename into an S3 key.
+
+    e.g. prefix="exports", period="2026-07", filename="customer.json"
+    -> "exports/2026-07/customer.json".
+    """
+    segments = [
+        segment.strip("/")
+        for segment in (prefix, period)
+        if segment and segment.strip("/")
+    ]
+    segments.append(filename)
+    return "/".join(segments)
 
 
 def create_s3_client(config: dict) -> Any:
@@ -716,7 +728,9 @@ def main() -> int:
             }
 
             if s3_client is not None:
-                key = build_s3_key(config["s3_prefix"], out_file.name)
+                key = build_s3_key(
+                    config["s3_prefix"], config["dump_period"], out_file.name
+                )
                 try:
                     upload_file_to_s3(
                         s3_client, config["s3_bucket"], key, out_file
@@ -770,6 +784,7 @@ def main() -> int:
                 "s3_enabled": config["s3_enabled"],
                 "s3_bucket": config["s3_bucket"] if config["s3_enabled"] else None,
                 "s3_prefix": config["s3_prefix"] if config["s3_enabled"] else None,
+                "dump_period": config["dump_period"] if config["s3_enabled"] else None,
                 "tables_exported": exported,
                 "tables_failed": failures,
                 "total_rows": total_rows,
