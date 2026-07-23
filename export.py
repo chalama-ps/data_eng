@@ -24,7 +24,8 @@ Configuration is driven entirely by environment variables (optionally via a
     FETCH_BATCH_SIZE   Rows fetched from the cursor per round-trip (default: 1000).
     TABLES_CONFIG      Path to include/exclude YAML file (default: "tables.yaml").
     MANIFEST_DIR       Directory for the run manifest (default: "manifests").
-                       Kept local; never uploaded to S3.
+                       Always written locally; also uploaded to S3 when
+                       S3_ENABLED=yes.
     LOG_DIR            Directory for log files (default: "logs").
     LOG_FILE           Log file name (default: "export.log"); a timestamp is
                        inserted and it is written under LOG_DIR.
@@ -40,8 +41,8 @@ Configuration is driven entirely by environment variables (optionally via a
     AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN
                        Optional explicit credentials. When omitted, boto3's
                        standard credential chain is used (env, profile, IAM
-                       role, SSO, etc.). Only table JSON files go to S3; logs
-                       and the manifest always stay local.
+                       role, SSO, etc.). Table JSON files and the manifest are
+                       uploaded to S3; logs always stay local.
 
 Table rules (tables.yaml) may use fully-qualified "schema.table" names, or
 bare "table" names which are qualified with DB_SCHEMA.
@@ -598,10 +599,11 @@ def export_table(
             time.sleep(backoff)
 
 
-def write_manifest(manifest_dir: str, manifest: dict) -> None:
+def write_manifest(manifest_dir: str, manifest: dict) -> Optional[Path]:
     """Write the run manifest to a temp file and atomically rename it.
 
-    The manifest is always written locally (never uploaded to S3).
+    The manifest is always written locally. Returns the path it was written to,
+    or None if writing failed.
     """
     manifest_path = Path(manifest_dir) / timestamped_filename("_manifest.json")
     try:
@@ -613,8 +615,10 @@ def write_manifest(manifest_dir: str, manifest: dict) -> None:
             json.dump(manifest, f, ensure_ascii=False, indent=2)
         os.replace(tmp_path, manifest_path)
         logger.info(f"Wrote run manifest file {manifest_path}")
+        return manifest_path
     except OSError as exc:
         logger.warning(f"Could not write manifest '{manifest_path}': {exc}")
+        return None
 
 
 def main() -> int:
@@ -644,6 +648,7 @@ def main() -> int:
     failures = 0
     exported = 0
     total_rows = 0
+    s3_client = None
     table_results: List[Dict[str, Any]] = []
     run_id = str(uuid.uuid4())
     started_at = datetime.datetime.now(datetime.timezone.utc)
@@ -670,7 +675,6 @@ def main() -> int:
             )
             return 1
 
-        s3_client = None
         if config["s3_enabled"]:
             try:
                 s3_client = create_s3_client(config)
@@ -771,7 +775,7 @@ def main() -> int:
 
     finished_at = datetime.datetime.now(datetime.timezone.utc)
     if table_results:
-        write_manifest(
+        manifest_path = write_manifest(
             config["manifest_dir"],
             {
                 "run_id": run_id,
@@ -791,6 +795,21 @@ def main() -> int:
                 "tables": table_results,
             },
         )
+
+        if manifest_path is not None and s3_client is not None:
+            key = build_s3_key(
+                config["s3_prefix"], config["dump_period"], manifest_path.name
+            )
+            try:
+                upload_file_to_s3(
+                    s3_client, config["s3_bucket"], key, manifest_path
+                )
+                logger.info(
+                    f"Uploaded manifest {manifest_path.name} to "
+                    f"s3://{config['s3_bucket']}/{key}"
+                )
+            except Exception as exc:
+                logger.error(f"Failed to upload manifest to S3: {exc}")
 
     logger.info(
         f"Exported {exported} table(s), {total_rows} row(s), "
